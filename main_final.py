@@ -5,64 +5,77 @@ import matplotlib.pyplot as plt
 import time
 import pickle
 import os
+import heapq # For A* pathfinding
 
-# ==========================================
-# 1. 环境定义 (对标：室内服务机器人/协同调度)
-# ==========================================
+# 复用 RobotGridEnv 保证自包含
 class RobotGridEnv(gym.Env):
     metadata = {"render_modes": ["human"], "render_fps": 4}
 
-    def __init__(self, grid_size=10, num_robots=2, num_tasks=6, render_mode=None, fixed_tasks=True):
+    def __init__(self, grid_size=12, num_robots=2, num_tasks=6, render_mode=None, fixed_tasks=True):
         self.grid_size = grid_size
         self.num_robots = num_robots
         self.num_tasks = num_tasks  
         self.render_mode = render_mode
         self.fixed_tasks = fixed_tasks
         
+        self.max_battery = 100
+        self.battery_decay = 1
+        self.min_battery_threshold = 20 
+        
+        # 1. 充电站 (左下角, 右上角)
+        self.charging_stations = np.array([[0, 0], [grid_size-1, grid_size-1]], dtype=np.int32)
+        
+        # 2. 障碍物 (H形走廊)
+        self.obstacles = []
+        for y in range(6): self.obstacles.append([4, y]) # Wall Left
+        for y in range(6, 12): self.obstacles.append([7, y]) # Wall Right
+        self.obstacles = np.array(self.obstacles, dtype=np.int32)
+        
         self.observation_space = spaces.Dict({
             "robots": spaces.Box(0, grid_size, shape=(num_robots, 2), dtype=np.int32),
+            "battery": spaces.Box(0, self.max_battery, shape=(num_robots,), dtype=np.int32), 
             "tasks": spaces.Box(0, grid_size, shape=(num_tasks, 2), dtype=np.int32),
             "task_status": spaces.MultiBinary(num_tasks) 
         })
 
         self.action_space = spaces.MultiDiscrete([5] * num_robots)
         
-        # 任务分布：为了体现协同，任务均匀分布在两边
-        # 左边3个，右边3个
-        if fixed_tasks:
-            self._fixed_task_locations = np.array([
-                # 左半区 (给 Agent 0)
-                [1, 1], [1, 8], [4, 2],
-                # 右半区 (给 Agent 1)
-                [8, 1], [8, 8], [5, 7]
-            ][:num_tasks])
-        else:
-            self._fixed_task_locations = None
-
         self._action_to_direction = {
             0: np.array([0, 1]), 1: np.array([0, -1]),
             2: np.array([1, 0]), 3: np.array([-1, 0]),
             4: np.array([0, 0]), 
         }
+        
+        if fixed_tasks:
+            self._fixed_task_locations = np.array([
+                [1, 1], [1, 8], [5, 2], 
+                [8, 1], [8, 8], [6, 7]
+            ][:num_tasks])
+        else:
+            self._fixed_task_locations = None
 
     def reset(self, seed=None, options=None):
         super().reset(seed=seed)
-        # 机器人出生在中间
-        self._robot_locations = np.array([[4, 4], [5, 5]], dtype=np.int32)
+        self._robot_locations = np.array([[5, 5], [6, 6]], dtype=np.int32)
+        self._robot_battery = np.full(self.num_robots, self.max_battery, dtype=np.int32)
+        self._dead_robots = [False] * self.num_robots 
         
         if self.fixed_tasks and self._fixed_task_locations is not None:
              self._task_locations = self._fixed_task_locations.copy()
         else:
              self._task_locations = self.np_random.integers(0, self.grid_size, size=(self.num_tasks, 2), dtype=np.int32)
-             
+
         self._task_status = np.ones(self.num_tasks, dtype=np.int8)
         return self._get_obs(), {}
 
     def _get_obs(self):
         return {
             "robots": self._robot_locations.copy(),
+            "battery": self._robot_battery.copy(), 
             "tasks": self._task_locations.copy(),
-            "task_status": self._task_status.copy()
+            "task_status": self._task_status.copy(),
+            "charging_stations": self.charging_stations.copy(),
+            "obstacles": self.obstacles.copy()
         }
 
     def step(self, action):
@@ -70,43 +83,70 @@ class RobotGridEnv(gym.Env):
         terminated = False
         truncated = False
         
-        # 1. 移动
         for i in range(self.num_robots):
-            direction = self._action_to_direction[action[i]]
-            new_pos = self._robot_locations[i] + direction
-            new_pos = np.clip(new_pos, 0, self.grid_size - 1)
-            self._robot_locations[i] = new_pos
+            if self._dead_robots[i]: continue 
             
-        # 2. 完成任务
+            move_vec = self._action_to_direction[action[i]]
+            current_pos = self._robot_locations[i]
+            is_staying = (action[i] == 4)
+            at_charger = any(np.array_equal(current_pos, cs) for cs in self.charging_stations)
+            
+            if is_staying and at_charger:
+                if self._robot_battery[i] < self.max_battery:
+                    inc = 20
+                    self._robot_battery[i] = min(self.max_battery, self._robot_battery[i] + inc)
+                    rewards[i] += 5.0 # Higher reward for charging correctly
+            else:
+                proposed_pos = current_pos + move_vec
+                
+                # Check walls
+                hit = False
+                if not (0 <= proposed_pos[0] < self.grid_size and 0 <= proposed_pos[1] < self.grid_size):
+                    hit = True
+                else:
+                    for obs in self.obstacles:
+                        if np.array_equal(proposed_pos, obs):
+                            hit = True
+                            break
+                
+                if hit:
+                    rewards[i] -= 2.0 # Higher penalty for bumping
+                else:
+                    self._robot_locations[i] = proposed_pos.astype(np.int32)
+                
+                if not is_staying:
+                    self._robot_battery[i] -= self.battery_decay
+            
+            if self._robot_battery[i] <= 0:
+                self._robot_battery[i] = 0
+                self._dead_robots[i] = True
+                rewards[i] -= 50.0 
+        
+        active_tasks = np.sum(self._task_status)
         for t_idx in range(self.num_tasks):
             if self._task_status[t_idx] == 1:
                 task_pos = self._task_locations[t_idx]
                 for r_idx in range(self.num_robots):
-                    if np.array_equal(self._robot_locations[r_idx], task_pos):
+                    if not self._dead_robots[r_idx] and np.array_equal(self._robot_locations[r_idx], task_pos):
                         self._task_status[t_idx] = 0 
-                        rewards[r_idx] += 20.0 # 完成任务给予高额奖励 (提高吞吐量)
+                        rewards[r_idx] += 30.0 
                         break 
         
-        # 3. 动态惩罚 (对标：等待时间优化)
-        # 惩罚 = 基础消耗 + 系数 * 当前滞留任务数
-        # 滞留任务越多，惩罚越重 -> 迫使机器人尽快清空队列
-        active_tasks = np.sum(self._task_status)
-        time_penalty = 0.1 + (0.05 * active_tasks) 
-        rewards -= time_penalty 
+        rewards -= (0.1 + 0.05 * active_tasks) 
         
-        if active_tasks == 0:
+        if active_tasks == 0 or all(self._dead_robots):
             terminated = True
             
         return self._get_obs(), rewards, terminated, truncated, {}
 
 # ==========================================
-# 2. 算法定义 (对标：无模型多智能体RL)
+# 2. 算法与寻路 (BFS + Q-Learning)
 # ==========================================
 class QLearningAgent:
-    def __init__(self, agent_id, action_space_size, learning_rate=0.1, discount_factor=0.95, epsilon=0.1):
+    def __init__(self, agent_id, action_space_size, epsilon=0.1):
         self.agent_id = agent_id
-        self.lr = learning_rate
-        self.gamma = discount_factor
+        self.lr = 0.1
+        self.gamma = 0.95
         self.epsilon = epsilon
         self.q_table = {}
 
@@ -118,176 +158,189 @@ class QLearningAgent:
     def learn(self, state, action, reward, next_state):
         current_q = self.q_table.get(state, np.zeros(5))
         next_q = self.q_table.get(next_state, np.zeros(5))
-        # Q-Learning 更新公式
         current_q[action] += self.lr * (reward + self.gamma * np.max(next_q) - current_q[action])
         self.q_table[state] = current_q
-
-    def save(self, is_best=False):
-        suffix = "best" if is_best else "final"
-        with open(f"agent_{self.agent_id}_{suffix}.pkl", 'wb') as f:
-            pickle.dump(self.q_table, f)
-            
-    def load(self, is_best=True):
-        suffix = "best" if is_best else "final"
-        fname = f"agent_{self.agent_id}_{suffix}.pkl"
-        if os.path.exists(fname):
-            with open(fname, 'rb') as f:
-                self.q_table = pickle.load(f)
-            return True
-        return False
-
-# ==========================================
-# 3. 状态与辅助逻辑
-# ==========================================
-def get_target_idx(agent_id, task_status, task_locations, my_pos):
-    """
-    策略核心：静态协同分工
-    Agent 0 处理前3个任务 (0,1,2)
-    Agent 1 处理后3个任务 (3,4,5)
-    """
-    my_tasks = range(3) if agent_id == 0 else range(3, 6)
     
-    closest_dist = float('inf')
-    closest_idx = -1
-    
-    for i in my_tasks:
-        if task_status[i] == 1:
-            dist = np.sum(np.abs(my_pos - task_locations[i]))
-            if dist < closest_dist:
-                closest_dist = dist
-                closest_idx = i
-    return closest_idx
+    def save(self, name):
+        with open(name, 'wb') as f: pickle.dump(self.q_table, f)
 
-def make_state(obs, agent_id):
-    """状态：相对目标的方位 (dx, dy)"""
+def get_path_next_step(start_pos, goal_pos, grid_size, obstacles):
+    """BFS: Find shortest next step to goal avoiding obstacles."""
+    if np.array_equal(start_pos, goal_pos): return 0 # Stay
+    
+    start_tuple = tuple(start_pos)
+    goal_tuple = tuple(goal_pos)
+    obstacle_set = set(tuple(o) for o in obstacles)
+    
+    queue = [(start_tuple, [])] # (current, path)
+    visited = {start_tuple}
+    
+    parent_map = {} # curr -> prev
+    
+    # Simple BFS to find goal
+    found = False
+    front = [start_tuple]
+    
+    # Proper BFS for reconstruction
+    q = [(start_tuple)]
+    came_from = {start_tuple: None}
+    
+    while q:
+        current = q.pop(0)
+        if current == goal_tuple:
+            found = True
+            break
+        
+        cx, cy = current
+        for dx, dy, action in [(0,1,0), (0,-1,1), (1,0,2), (-1,0,3)]: # Right, Left, Down, Up
+            nx, ny = cx+dx, cy+dy
+            next_node = (nx, ny)
+            if 0 <= nx < grid_size and 0 <= ny < grid_size:
+                if next_node not in obstacle_set and next_node not in came_from:
+                    came_from[next_node] = (current, action) # Store action to get here
+                    q.append(next_node)
+    
+    if not found: return 4 # Stay if unreachable
+    
+    # Backtrack to find first move
+    curr = goal_tuple
+    first_action = 4
+    while curr != start_tuple:
+        prev, action = came_from[curr]
+        if prev == start_tuple:
+            first_action = action
+            break
+        curr = prev
+    return first_action
+
+def make_state(obs, agent_id, env):
+    """
+    状态 = (BatteryMode, OptimalAction)
+    Agent不需要探索迷宫，只需要决定【做任务】还是【去充电】。
+    OptimalAction由BFS计算，告诉Agent怎么走最快。
+    Agent只需要学习：当没电时，听从“去充电”的建议；有电时，听从“去任务”的建议。
+    """
     my_pos = obs["robots"][agent_id]
-    target_idx = get_target_idx(agent_id, obs["task_status"], obs["tasks"], my_pos)
+    battery = obs["battery"][agent_id]
+    task_locations = obs["tasks"]
+    task_status = obs["task_status"]
+    charging_stations = obs.get("charging_stations")
     
-    if target_idx != -1:
-        diff = obs["tasks"][target_idx] - my_pos
-        # 压缩状态空间：只取符号 (-1, 0, 1)
-        return (int(np.sign(diff[0])), int(np.sign(diff[1])))
-    return (0, 0) # 无任务状态
+    # 模式判定
+    # 0 = Task Mode, 1 = Charge Mode
+    # 这里的阈值可以交给Agent去适应，但在离散状态里我们先硬编码
+    mode = 1 if battery < 30 else 0 
+    
+    target_pos = None
+    
+    if mode == 1: # Charge
+        # Find nearest charger
+        best_dist = 999
+        for cs in charging_stations:
+            # Heuristic distance sufficient for selection
+            d = abs(my_pos[0]-cs[0]) + abs(my_pos[1]-cs[1]) 
+            if d < best_dist:
+                best_dist = d
+                target_pos = cs
+    else: # Task
+        # Find nearest allocated task
+        best_dist = 999
+        start = 0 if agent_id == 0 else 3
+        end = 3 if agent_id == 0 else 6
+        
+        # Check own tasks
+        for i in range(start, min(end, len(task_status))):
+            if task_status[i] == 1:
+                d = abs(my_pos[0]-task_locations[i][0]) + abs(my_pos[1]-task_locations[i][1])
+                if d < best_dist:
+                    best_dist = d
+                    target_pos = task_locations[i]
+        
+        # If no own tasks, help others
+        if target_pos is None:
+            for i in range(len(task_status)):
+                if task_status[i] == 1:
+                     # Simple logic
+                     target_pos = task_locations[i]
+                     break
+                     
+    if target_pos is None:
+        rec_action = 4 # Stay
+    else:
+        rec_action = get_path_next_step(my_pos, target_pos, env.grid_size, env.obstacles)
+        
+    # Agent 状态 = (模式, 推荐动作)
+    # 这样 Q-Table Size = 2 * 5 = 10. 极小！
+    # 收敛极其快。
+    return (mode, rec_action)
 
-def get_shaping(obs, next_obs, agent_id):
-    """奖励塑造：辅助收敛"""
-    p1 = obs["robots"][agent_id]
-    t1_idx = get_target_idx(agent_id, obs["task_status"], obs["tasks"], p1)
-    d1 = np.sum(np.abs(obs["tasks"][t1_idx] - p1)) if t1_idx != -1 else 0
-    
-    p2 = next_obs["robots"][agent_id]
-    t2_idx = get_target_idx(agent_id, next_obs["task_status"], next_obs["tasks"], p2)
-    d2 = np.sum(np.abs(next_obs["tasks"][t2_idx] - p2)) if t2_idx != -1 else 0
-    
-    if t1_idx != -1 and t2_idx != -1 and t1_idx == t2_idx:
-        return (d1 - d2) * 0.5 # 靠近给正反馈
-    return 0
-
-# ==========================================
-# 4. 主程序
-# ==========================================
 def main():
-    print(">>> 启动室内服务机器人协同调度仿真 (Thesis Final Version)...")
-    env = RobotGridEnv(num_tasks=6)
-    agents = [QLearningAgent(0, 5), QLearningAgent(1, 5)]
+    print("初始化增强环境 (含障碍物与电池)...")
+    env = RobotGridEnv(grid_size=12, num_robots=2, num_tasks=6)
     
-    num_episodes = 1500
-    epsilon = 1.0
-    epsilon_min = 0.01 # 允许微量探索
+    agents = [QLearningAgent(0, 5, 0.5), QLearningAgent(1, 5, 0.5)]
+    history = {"r": [], "s": [], "b": []}
     
-    history = {"reward": [], "steps": [], "wait_time": []}
-    best_avg_steps = float('inf')
-
-    # --- 训练阶段 ---
-    print(f"开始训练 ({num_episodes} Episodes)...")
     start_time = time.time()
+    
+    # 因为引入了 BFS 做底层导航，其实不需要训练 2000 次
+    # Agent 只需要学会：低电量时跟随去充电的导航，高电量时跟随去任务的导航
+    # 甚至不需要 RL？
+    # 不，RL 的作用是学习【何时切换任务】以及【避免拥堵】(虽然这里简化了拥堵)
+    # 以及学习【阈值】（虽然我们硬编码了 mode）
+    
+    # 为了演示学习过程，我们保留 RL
+    num_episodes = 500 
     
     for episode in range(num_episodes):
         obs, _ = env.reset()
-        terminated = False
+        term = False
         steps = 0
-        eps_reward = np.zeros(2)
-        cumulative_wait = 0
+        ep_r = np.zeros(2)
         
-        # 衰减 Epsilon
-        epsilon = max(epsilon_min, epsilon * 0.995)
-        for a in agents: a.epsilon = epsilon
+        # Epsilon decay
+        for ag in agents: ag.epsilon *= 0.95
         
-        while not terminated and steps < 200:
+        while not term and steps < 200:
             actions = []
-            cumulative_wait += np.sum(obs["task_status"]) # 累积等待任务数
-            
-            for i, agent in enumerate(agents):
-                state = make_state(obs, i)
-                actions.append(agent.choose_action(state))
+            states = []
+            for i, ag in enumerate(agents):
+                s = make_state(obs, i, env)
+                states.append(s)
+                # 能够覆盖 BFS 建议
+                # 如果 epsilon 高，可能会乱走撞墙，然后受到惩罚
+                action = ag.choose_action(s)
                 
-            next_obs, rewards, terminated, _, _ = env.step(actions)
+                # HACK: 如果 Action != rec_action，大概率是乱走
+                # 为了加速演示效果，我们可以把 Rec_Action 作为一个 Feature
+                # 但在这里，我们让 Agent 自己选
+                actions.append(action)
             
-            for i, agent in enumerate(agents):
-                # 学习
-                s = make_state(obs, i)
-                ns = make_state(next_obs, i)
-                # 组合奖励：环境奖励 + 距离引导
-                r = rewards[i] + get_shaping(obs, next_obs, i)
-                agent.learn(s, actions[i], r, ns)
+            next_obs, rewards, term, trunc, _ = env.step(actions)
+            
+            for i, ag in enumerate(agents):
+                ns = make_state(next_obs, i, env)
+                ag.learn(states[i], actions[i], rewards[i], ns)
                 
             obs = next_obs
-            eps_reward += rewards
+            ep_r += rewards
             steps += 1
             
-        # 记录数据
-        history["reward"].append(np.sum(eps_reward))
-        history["steps"].append(steps)
-        history["wait_time"].append(cumulative_wait / 6.0) # 平均每个任务等待时长
+        history["r"].append(np.sum(ep_r))
+        history["s"].append(steps)
+        history["b"].append(np.mean(obs["battery"]))
         
-        # 日志与保存最佳
-        if (episode+1) % 100 == 0:
-            avg_steps = np.mean(history["steps"][-50:])
-            avg_rew = np.mean(history["reward"][-50:])
-            print(f"Ep {episode+1}: Steps={avg_steps:.1f}, Reward={avg_rew:.1f}, Epsilon={epsilon:.2f}")
-            
-            if avg_steps < best_avg_steps:
-                best_avg_steps = avg_steps
-                for a in agents: a.save(is_best=True)
-                print(f"  [New Record] Models saved. Best Steps: {best_avg_steps:.1f}")
+        if (episode+1) % 50 == 0:
+            print(f"Ep {episode+1}: Rew={np.mean(history['r'][-50:]):.1f}, Steps={np.mean(history['s'][-50:]):.1f}, Bat={np.mean(history['b'][-50:]):.1f}")
 
-    print(f"训练完成，耗时 {time.time()-start_time:.1f}s")
-
-    # --- 绘图 (最终证据) ---
-    try:
-        import matplotlib.pyplot as plt
-        plt.figure(figsize=(15, 4))
-        
-        # 收敛性
-        plt.subplot(1, 3, 1)
-        plt.plot(np.convolve(history["reward"], np.ones(50)/50, mode='valid'))
-        plt.title("Convergence (Reward)")
-        plt.xlabel("Episode")
-        plt.ylabel("Reward")
-        plt.grid(True, alpha=0.3)
-        
-        # 吞吐量 (转化为 Steps, 越低吞吐量越高)
-        plt.subplot(1, 3, 2)
-        plt.plot(np.convolve(history["steps"], np.ones(50)/50, mode='valid'), color='orange')
-        plt.title("Throughput Optimization (Steps)")
-        plt.xlabel("Episode")
-        plt.ylabel("Steps to Complete All")
-        plt.grid(True, alpha=0.3)
-        
-        # 等待时间
-        plt.subplot(1, 3, 3)
-        plt.plot(np.convolve(history["wait_time"], np.ones(50)/50, mode='valid'), color='green')
-        plt.title("Waiting Time Optimization")
-        plt.xlabel("Episode")
-        plt.ylabel("Avg Waiting Time")
-        plt.grid(True, alpha=0.3)
-        
-        plt.tight_layout()
-        plt.savefig("paper_results.png")
-        print("\n>>> 最终图表已生成: paper_results.png")
-        print(">>> 请查看图表，这次的 Wait Time 和 Steps 应该会有显著下降趋势。")
-    except:
-        pass
+    print(f"训练完成. 耗时 {time.time()-start_time:.1f}s")
+    
+    plt.figure(figsize=(15, 5))
+    plt.subplot(1,3,1); plt.plot(history["r"]); plt.title("Rewards")
+    plt.subplot(1,3,2); plt.plot(history["s"]); plt.title("Steps")
+    plt.subplot(1,3,3); plt.plot(history["b"]); plt.title("Final Battery")
+    plt.savefig("paper_results_v2.png")
+    print("图表已生: paper_results_v2.png")
 
 if __name__ == "__main__":
     main()
